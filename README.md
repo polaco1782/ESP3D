@@ -51,8 +51,22 @@ before starting a job. UART pins, baud rate and board wiring remain configurable
 Read the [streaming guide](docs/marlin_streaming.md) for setup requirements,
 commands, limits, diagnostics and validation scope. During a stream, unsupported
 manual commands and polling can return HTTP 409 (Conflict); temperature setpoints
-and host controls have dedicated handling. The separate ESP3D-WEBUI project is
-not modified by this firmware fork.
+and host controls have dedicated handling.
+
+## Customized (better) ESP3D-WEBUI
+
+Use the companion **[(better) ESP3D-WEBUI](https://github.com/polaco1782/ESP3D-WEBUI)**
+(`3.1` branch) with this firmware. Its Marlin workspace adds printing directly
+from the ESP32 SD file list, acknowledged job progress, Pause/Resume/Cancel,
+and Print, Prepare, Temperatures and Console tabs. It also handles the firmware's
+UART ownership response during automatic polling.
+
+The main interface is a single `index.html.gz` installed in ESP3D's internal
+Flash filesystem; print files remain on the ESP32 SD card. Build and install the
+Marlin version using the companion repository's
+[installation and printing guide](https://github.com/polaco1782/ESP3D-WEBUI/blob/3.1/docs/BETTER_ESP3D.md).
+Update the UI while idle and preserve `preferences.json`. The firmware and WebUI
+are maintained in separate repositories and must be installed separately.
 
 ## Upstream setup and resources
 
@@ -64,12 +78,11 @@ To compile ESP3D you need to edit the configuration.h according your needs.
 You can also generate it, using [![Development  Version](https://img.shields.io/badge/ESP3D-Configurator-red?style=for-the-badge&logo=preact)](https://luc-github.github.io/) which simplify a lot this step.   
 or click here: https://luc-github.github.io/      
 
-ESP3D 3.1 use [![Development  Version](https://img.shields.io/badge/Devt-v3.1-yellow?style=plastic&label=ESP3D-WEBUI)](https://github.com/luc-github/ESP3D-WEBUI/tree/3.1), but it is built according your system and your system firmware:[![Development  Version](https://img.shields.io/badge/Devt-v3.1-yellow?style=plastic&label=WebUI%20Packages)](https://github.com/luc-github/ESP3D-WEBUI/tree/3.1/dist/). 
-
-so you need to use the right one, the [ESP3D-Configurator](https://luc-github.github.io/) may also help you to download the correct version for your needs.
+The upstream configurator can help generate firmware configuration. For this
+fork's customized interface, use the companion WebUI installation guide above.
 
 ![Development](https://img.shields.io/badge/dynamic/json?label=Development&query=$.devt&color=green&style=plastic&url=https://raw.githubusercontent.com/luc-github/ESP3D/refs/heads/3.1/info.json)
-[![Development  Version](https://img.shields.io/badge/Devt-v3.1-yellow?style=plastic&label=ESP3D-WEBUI)](https://github.com/luc-github/ESP3D-WEBUI/tree/3.1)
+[![(better) ESP3D-WEBUI](https://img.shields.io/badge/%28better%29%20ESP3D--WEBUI-3.1-blue?style=plastic)](https://github.com/polaco1782/ESP3D-WEBUI/tree/3.1)
 ![GitHub last commit (branch)](https://img.shields.io/github/last-commit/luc-github/ESP3D/3.1?style=plastic)
 [![github-ci](https://github.com/luc-github/ESP3D/workflows/build-ci/badge.svg)](https://github.com/luc-github/ESP3D/actions/workflows/build-ci.yml)
 

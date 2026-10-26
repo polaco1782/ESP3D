@@ -118,6 +118,25 @@ particular, LittleFS source handles are not moved across tasks while HTTP uses
 its global file-handle table. The dedicated worker currently covers the requested
 ESP32 SD-to-UART print path and UART scripts.
 
+## Customized WebUI
+
+Use **[(better) ESP3D-WEBUI](https://github.com/polaco1782/ESP3D-WEBUI)** with this
+firmware for the customized Marlin workspace. Its **Print** file list starts an
+ESP32 SD job with `[ESP700]/SD/<file>`; **Current print** shows acknowledged
+progress and provides Pause, Resume and Cancel through `[ESP701]`.
+
+Follow the WebUI's
+[installation and printing guide](https://github.com/polaco1782/ESP3D-WEBUI/blob/3.1/docs/BETTER_ESP3D.md)
+to build and install `index.html.gz` in internal Flash while the printer is idle.
+Keep `preferences.json`; the G-code files remain on the ESP32 SD card. Installing
+this firmware alone does not replace the WebUI assets.
+
+The WebUI handles automatic polling while the firmware owns the printer UART.
+Other clients can still receive HTTP 409 for unsupported manual commands during
+streaming. The transport supports the temperature setpoints described below;
+the companion UI currently disables preparation and heating controls during a
+stream, as documented in its guide.
+
 ## Controls and completion
 
 | Command | Behavior |
