@@ -1,10 +1,34 @@
-# Buffered Marlin streaming
+# (better) ESP3D: buffered Marlin streaming
 
 With `GCODE_HOST_FEATURE` enabled and the firmware target set to `MARLIN` or
 `MARLIN_EMBEDDED`, `[ESP700]/SD/file.gcode` uses the buffered Marlin transport.
 `/FS/file.gcode` and semicolon-separated scripts use the same transport. Other
 firmware targets keep the existing host. The Orca upload/start compatibility
 handler also reaches this transport through `processFile()`.
+
+## Minimum hardware
+
+**(better) ESP3D requires at minimum a dual-core ESP32.** Single-core ESP32
+variants, ESP8266 and ESP8285 are outside this fork's supported hardware scope.
+For the dedicated streaming worker, use an ESP32-connected SD card and a UART
+connection to Marlin. Both CPU cores must be enabled in the build so the worker
+can run on the core opposite the application loop.
+
+## Changes at a glance
+
+The fork adds a buffered, acknowledged Marlin transport and separates SD-to-UART
+streaming from HTTP/WebSocket handling across the two cores. It also adds
+controlled resend recovery, explicit heating waits, pause/resume/cancel,
+queued nozzle and bed temperature changes, and serial/worker diagnostics.
+Native tests exercise the protocol and its host/worker integration. The
+[README overview](../README.md#what-changed) summarizes the user-facing changes;
+the sections below describe their behavior and limits.
+
+The Orca compatibility upload endpoint, `/upload_serial`, reuses ESP3D's SD upload
+handler. Its `/command?plain=...` handling accepts the connection test and maps
+`M23`/`M24` to selection and streaming of the uploaded ESP3D SD file. Starting with
+`[ESP700]/SD/file.gcode` reaches the same host transport. This workflow stores the
+file on ESP3D's SD card and sends its commands over the configured printer link.
 
 ## Printer requirements
 
@@ -59,8 +83,9 @@ For SD files and scripts sent through an ESP32 UART, `marlin_stream` runs in a
 FreeRTOS task pinned to the core opposite the application task that calls
 `begin()` (priority 2, 6 KiB stack). HTTP and WebSocket handling remain in the
 application loop. The worker derives its core from the calling task rather than
-requiring a board-specific `ARDUINO_RUNNING_CORE` setting. On a single-core ESP32
-variant the worker uses core 0 with preemptive scheduling. This uses ESP-IDF's
+requiring a board-specific `ARDUINO_RUNNING_CORE` setting. The retained single-core
+fallback uses core 0 with preemptive scheduling, but is outside this fork's
+supported hardware scope. This uses ESP-IDF's
 [pinned-task API](https://docs.espressif.com/projects/esp-idf/en/v4.4/esp32/api-reference/system/freertos.html).
 Pinning does not isolate shared SPI, flash, UART or system networking resources;
 physical throughput and task stack margins still need hardware measurement.
@@ -87,7 +112,8 @@ physical throughput and task stack margins still need hardware measurement.
   the stream owns the connection. Task/queue allocation failure rejects jobs
   requiring the worker rather than silently reverting to main-loop timing.
 
-USB serial, LittleFS sources and ESP8266 retain the cooperative host path. In
+USB serial and LittleFS sources retain the cooperative host path. The inherited
+ESP8266 path is also retained, but ESP8266 is not supported by this fork. In
 particular, LittleFS source handles are not moved across tasks while HTTP uses
 its global file-handle table. The dedicated worker currently covers the requested
 ESP32 SD-to-UART print path and UART scripts.
@@ -231,6 +257,9 @@ UNICORE=1 tests/marlin_stream/run_worker.sh
 MAIN_CORE=1 tests/marlin_stream/run_worker.sh
 pio run -e esp32dev
 ```
+
+`UNICORE=1` checks the retained compatibility fallback; passing it does not make
+single-core deployment supported. The supported deployment requires two cores.
 
 The native runner uses Clang by default (`CXX` can override it), strict warnings,
 AddressSanitizer and UndefinedBehaviorSanitizer. LeakSanitizer is disabled because

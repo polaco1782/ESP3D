@@ -1,9 +1,64 @@
-# ESP3D 3.1 ![ESP3D](https://img.shields.io/badge/dynamic/json?label=ESP3D&query=$.version&url=https://raw.githubusercontent.com/luc-github/ESP3D/refs/heads/3.1/info.json)
+# (better) ESP3D 3.1 ![ESP3D](https://img.shields.io/badge/dynamic/json?label=ESP3D&query=$.version&url=https://raw.githubusercontent.com/luc-github/ESP3D/refs/heads/3.1/info.json)
 <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
 [![All Contributors](https://img.shields.io/badge/all_contributors-28-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 <img src="https://github.com/luc-github/ESP3D/blob/3.1/images/Screen/logo2.png">
-Firmware for ESP8266/ESP8285 and ESP32 (original, pico, S2, S3, C3, C6) used with 3D printer/Sand-Table and CNC 
+
+**(better) ESP3D** is a fork of [ESP3D 3.1](https://github.com/luc-github/ESP3D/tree/3.1)
+focused on streaming G-code from the ESP32's SD card to a Marlin printer while
+keeping the web interface responsive. It builds on the original ESP3D project;
+upstream credits and attribution are retained below.
+
+## Minimum hardware and firmware requirements
+
+**This fork requires at minimum an ESP32 with two CPU cores.** Single-core ESP32
+variants, ESP8266 and ESP8285 do not meet the supported hardware requirement.
+The SD-to-printer workflow also requires an SD card connected to ESP32 and a
+UART connection to the printer, with matching baud rates on both devices.
+
+Enable `GCODE_HOST_FEATURE`, configure the SD card and serial output, and select
+`MARLIN` or `MARLIN_EMBEDDED` as the firmware target. Marlin must provide
+`ADVANCED_OK`, `EMERGENCY_PARSER`, keepalive reports and sufficient serial buffers;
+see the [full printer requirements](docs/marlin_streaming.md#printer-requirements)
+before starting a job. UART pins, baud rate and board wiring remain configurable.
+
+## What changed
+
+- **Buffered Marlin streaming:** commands carry line numbers and checksums, with
+  a bounded buffer of outstanding commands. Numbered acknowledgments advance the
+  stream, and resend requests replay retained commands in order. Heating, homing
+  and other blocking operations have explicit wait handling.
+- **Work split across both cores:** SD-to-UART streaming runs in a dedicated
+  FreeRTOS task on the core opposite the application loop. HTTP and WebSocket
+  handling stay in the application loop, so streaming can progress independently
+  of web requests. Separate protocol and display queues keep slow UI clients
+  from blocking acknowledgments.
+- **Print controls:** pause drains accepted commands and waits for motion to
+  finish; resume continues the file. Cooperative cancel drains accepted work and
+  turns off the active hotend, bed and fan. A printer-display cancel requests
+  this cleanup; genuine printer or transport faults still trigger emergency stop.
+- **Temperature adjustment during printing:** manual nozzle (`M104`) and bed
+  (`M140`) setpoints enter the same numbered stream with acknowledgment and
+  resend handling. They take priority over unread file commands, but must wait
+  for an already active heating or homing command to finish.
+- **OrcaSlicer upload and start:** the compatibility endpoint accepts an upload
+  onto ESP3D's SD card. Its `M23`/`M24` compatibility handling selects that upload
+  and starts the same host transport used by `[ESP700]`.
+- **Diagnostics and local tests:** `[ESP701]diag` exposes recent serial replies,
+  protocol state and UART/worker counters. Native protocol, host and threaded
+  worker tests cover acknowledgments, resends, waits, controls and fault handling.
+
+Read the [streaming guide](docs/marlin_streaming.md) for setup requirements,
+commands, limits, diagnostics and validation scope. During a stream, unsupported
+manual commands and polling can return HTTP 409 (Conflict); temperature setpoints
+and host controls have dedicated handling. The separate ESP3D-WEBUI project is
+not modified by this firmware fork.
+
+## Upstream setup and resources
+
+The inherited source retains compatibility paths for other chips, but those
+paths do not change this fork's dual-core ESP32 requirement. The following resources describe the original ESP3D project; use the
+requirements above and the streaming guide for this fork.
 
 To compile ESP3D you need to edit the configuration.h according your needs.   
 You can also generate it, using [![Development  Version](https://img.shields.io/badge/ESP3D-Configurator-red?style=for-the-badge&logo=preact)](https://luc-github.github.io/) which simplify a lot this step.   
