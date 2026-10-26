@@ -25,6 +25,9 @@
 #include "../../core/esp3d_string.h"
 #include "../authentication/authentication_service.h"
 #include "serial_service.h"
+#if defined(GCODE_HOST_FEATURE) && defined(ARDUINO_ARCH_ESP32)
+#include "../gcode_host/gcode_host.h"
+#endif
 
 extern HardwareSerial *Serials[];
 
@@ -91,6 +94,9 @@ void ESP3DSerialService::flushBuffer() {
 
 
 void ESP3DSerialService::updateBaudRate(uint32_t br) {
+#if defined(GCODE_HOST_FEATURE) && defined(ARDUINO_ARCH_ESP32)
+  if (esp3d_gcode_host.workerUsesSerial(_origin)) return;
+#endif
   if (br != _baudRate) {
     Serials[_serialIndex]->flush();
     Serials[_serialIndex]->updateBaudRate(br);
@@ -155,7 +161,9 @@ bool ESP3DSerialService::dispatch(ESP3DMessage *message) {
       // if message is not null
       if (message->data && message->size != 0) {
         if (writeBytes(message->data, message->size) == message->size) {
-          flush();
+          // UART hardware/driver drains streamed bytes in order. A per-line TX
+          // drain defeats the bounded Marlin window; explicit flush() still exists.
+          if (message->origin != ESP3DClientType::stream) flush();
           // Delete message now
           esp3d_message_manager.deleteMsg(message);
           done = true;

@@ -1319,6 +1319,27 @@ bool ESP3DCommands::dispatch(ESP3DMessage *msg) {
     esp3d_log_e("no msg");
     return false;
   }
+#if defined(GCODE_HOST_FEATURE)
+  if (esp3d_gcode_host.ownsPrinter() &&
+      msg->target == esp3d_gcode_host.printerClient() && msg->origin != ESP3DClientType::stream) {
+    // Accepted tuning commands join the numbered stream; they never bypass
+    // its TX ownership, acknowledgments or resend history.
+    String command((const char*)msg->data);
+    command.trim();
+    bool accepted = false;
+    if (command.equalsIgnoreCase("M112")) esp3d_gcode_host.emergencyStop();
+    else if (esp3d_gcode_host.queueTemperature(command.c_str())) accepted = true;
+    else if (msg->origin != ESP3DClientType::system &&
+             msg->origin != ESP3DClientType::http &&
+             msg->origin != ESP3DClientType::command && msg->origin != getOutputClient()) {
+      dispatch("error: printer connection owned by Marlin stream\n", msg->origin,
+               msg->request_id, ESP3DMessageType::unique, ESP3DClientType::command,
+               msg->authentication_level);
+    }
+    esp3d_message_manager.deleteMsg(msg);
+    return accepted;
+  }
+#endif
   // currently only echo back no test done on success
   // TODO check add is successful
   switch (msg->target) {
@@ -1537,7 +1558,8 @@ bool ESP3DCommands::dispatch(ESP3DMessage *msg) {
 #endif  // ESP_LUA_INTERPRETER_FEATURE
 
 #if defined(GCODE_HOST_FEATURE)
-      if (msg->origin != ESP3DClientType::stream && esp3d_gcode_host.getStatus() != HOST_NO_STREAM) {
+      if (msg->origin == (esp3d_gcode_host.ownsPrinter() ? esp3d_gcode_host.printerClient() : getOutputClient()) &&
+          esp3d_gcode_host.getStatus() != HOST_NO_STREAM) {
         if (msg->target == ESP3DClientType::all_clients) {
           // become the reference message
           msg->target = ESP3DClientType::stream;

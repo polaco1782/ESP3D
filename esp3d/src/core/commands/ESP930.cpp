@@ -24,6 +24,10 @@
 #include "../esp3d_commands.h"
 #include "../esp3d_settings.h"
 
+#if defined(GCODE_HOST_FEATURE)
+#include "../../modules/gcode_host/gcode_host.h"
+#endif
+
 #define COMMAND_ID 930
 // Set Bridge Serial state which can be ON, OFF, CLOSE
 //[ESP930]<state> json=<no> pwd=<admin password>
@@ -49,6 +53,12 @@ void ESP3DCommands::ESP930(int cmd_params_pos, ESP3DMessage* msg) {
   }
 #endif  // AUTHENTICATION_FEATURE
   tmpstr = get_clean_param(msg, cmd_params_pos);
+#if defined(GCODE_HOST_FEATURE)
+  if (tmpstr.length() && esp3d_gcode_host.ownsPrinter()) {
+    dispatchAnswer(msg, COMMAND_ID, json, true, "Cannot change serial service during a stream");
+    return;
+  }
+#endif
   if (tmpstr.length() == 0) {
     if (ESP3DSettings::readByte(ESP_SERIAL_BRIDGE_ON) == 1) {
       ok_msg = "ENABLED";

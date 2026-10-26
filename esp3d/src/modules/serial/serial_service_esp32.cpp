@@ -26,6 +26,9 @@
 #include "../../core/esp3d_string.h"
 #include "../authentication/authentication_service.h"
 #include "serial_service.h"
+#if defined(GCODE_HOST_FEATURE)
+#include "../gcode_host/gcode_host.h"
+#endif
 
 #define SERIAL_COMMUNICATION_TIMEOUT 500
 
@@ -91,26 +94,33 @@ void ESP3DSerialService::receiveCb() {
     // Get expected len of data
     size_t count = Serials[_serialIndex]->available();
     
-    //loop until each byte is handled
+    // Capture raw chunks before main-loop routing or realtime-character parsing.
+    // The selected Marlin UART feeds a bounded worker queue directly.
     while (count > 0) {
-      int data = Serials[_serialIndex]->read();
-      
-      // If  read() failed we leave
-      if (data == -1) {
-        esp3d_log_e("Serial read failed unexpectedly");
-        break;  // only break to release mutex
+      uint8_t chunk[64];
+      size_t size = 0;
+      while (size < sizeof(chunk) && count > 0) {
+        int data = Serials[_serialIndex]->read();
+        if (data == -1) { count = 0; break; }
+        chunk[size++] = static_cast<uint8_t>(data);
+        --count;
       }
-      //take the char
-      count--;
-      _buffer[_buffer_size] = (uint8_t)data;
-      //check what next step is
-      if (esp3d_string::isRealTimeCommand(_buffer[_buffer_size])) {
-        flushChar(_buffer[_buffer_size]);
-        _buffer[_buffer_size] = '\0'; //remove realtime command from buffer
-      } else {
-        _buffer_size++;
-        if (_buffer_size > ESP3D_SERIAL_BUFFER_SIZE || _buffer[_buffer_size - 1] == '\n') {
-          flushBuffer();
+      if (!size) break;
+#if defined(GCODE_HOST_FEATURE)
+      if (esp3d_gcode_host.captureSerial(_origin, chunk, size)) {
+        _buffer_size = 0;
+        continue;
+      }
+#endif
+      for (size_t i = 0; i < size; ++i) {
+        _buffer[_buffer_size] = chunk[i];
+        if (esp3d_string::isRealTimeCommand(_buffer[_buffer_size])) {
+          flushChar(_buffer[_buffer_size]);
+          _buffer[_buffer_size] = '\0';
+        } else {
+          ++_buffer_size;
+          if (_buffer_size >= ESP3D_SERIAL_BUFFER_SIZE ||
+              _buffer[_buffer_size - 1] == '\n') flushBuffer();
         }
       }
     }
@@ -123,6 +133,10 @@ void ESP3DSerialService::receiveCb() {
 
 // Setup Serial
 bool ESP3DSerialService::begin(uint8_t serialIndex) {
+#if defined(GCODE_HOST_FEATURE)
+  // Do not destroy or reconfigure a UART while the other core is writing it.
+  if (esp3d_gcode_host.workerUsesSerial(_origin)) return false;
+#endif
   _mutex = xSemaphoreCreateMutex();
   if (_mutex == NULL) {
     esp3d_log_e("Mutex creation failed");
@@ -170,14 +184,27 @@ bool ESP3DSerialService::begin(uint8_t serialIndex) {
       br = defaultBr;
     }
     Serials[_serialIndex]->setRxBufferSize(SERIAL_RX_BUFFER_SIZE);
+#if defined(GCODE_HOST_FEATURE)
+    Serials[_serialIndex]->setTxBufferSize(256);
+#endif
     Serials[_serialIndex]->begin(br, ESP_SERIAL_PARAM, _rxPin, _txPin);
     _baudRate = br;
     if (_id == MAIN_SERIAL) {
       Serials[_serialIndex]->onReceive(receiveSerialCb);
+#if defined(GCODE_HOST_FEATURE)
+      Serials[_serialIndex]->onReceiveError([](hardwareSerial_error_t error) {
+        esp3d_gcode_host.recordSerialError(ESP3DClientType::serial, error);
+      });
+#endif
     }
 #if defined(ESP_SERIAL_BRIDGE_OUTPUT)
     if (_id == BRIDGE_SERIAL) {
       Serials[_serialIndex]->onReceive(receiveBridgeSerialCb);
+#if defined(GCODE_HOST_FEATURE)
+      Serials[_serialIndex]->onReceiveError([](hardwareSerial_error_t error) {
+        esp3d_gcode_host.recordSerialError(ESP3DClientType::serial_bridge, error);
+      });
+#endif
     }
 #endif  // ESP_SERIAL_BRIDGE_OUTPUT
   }
@@ -188,6 +215,10 @@ bool ESP3DSerialService::begin(uint8_t serialIndex) {
 
 // End serial
 bool ESP3DSerialService::end() {
+#if defined(GCODE_HOST_FEATURE)
+  // Do not destroy or reconfigure a UART while the other core is writing it.
+  if (esp3d_gcode_host.workerUsesSerial(_origin)) return false;
+#endif
   flush();
   delay(100);
   if (_mutex != NULL) {

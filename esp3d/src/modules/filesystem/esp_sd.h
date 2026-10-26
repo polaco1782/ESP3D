@@ -23,6 +23,9 @@
 
 #include "../../include/esp3d_config.h"
 #include "sd/esp_sd_common.h"
+#if defined(ARDUINO_ARCH_ESP32)
+#include <atomic>
+#endif
 
 class ESP_SDFile {
  public:
@@ -102,7 +105,11 @@ class ESP_SD {
 #endif  // SD_DEVICE_CONNECTION == ESP_SHARED_SD
  private:
   static bool _started;
+#if defined(ARDUINO_ARCH_ESP32)
+  static std::atomic<uint32_t> _acquireTimestamp;
+#else
   static uint32_t _acquireTimestamp;
+#endif
 #if SD_DEVICE_CONNECTION == ESP_SHARED_SD
   static bool _enabled;
   static IsMCUBusyFn _mcuBusyCallback;

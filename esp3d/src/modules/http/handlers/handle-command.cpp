@@ -33,6 +33,8 @@
 #include "../../authentication/authentication_service.h"
 #if defined(SD_DEVICE) && defined(GCODE_HOST_FEATURE)
 #include "../../filesystem/esp_sd.h"
+#endif
+#if defined(GCODE_HOST_FEATURE)
 #include "../../gcode_host/gcode_host.h"
 #endif
 
@@ -144,6 +146,21 @@ void HTTP_Server::handle_web_command() {
         esp3d_log_e("Cannot create message");
       }
     } else {
+#if defined(GCODE_HOST_FEATURE)
+      if (esp3d_gcode_host.ownsPrinter()) {
+        String control = cmd;
+        control.trim();
+        if (!control.equalsIgnoreCase("M112")) {
+          if (esp3d_gcode_host.queueTemperature(control.c_str())) {
+            HTTP_Server::set_http_headers();
+            _webserver->send(200, "text/plain", "ESP3D says: temperature change queued");
+            return;
+          }
+          _webserver->send(409, "text/plain", "Marlin stream owns printer connection; use ESP701");
+          return;
+        }
+      }
+#endif
       HTTP_Server::set_http_headers();
       // the command is not ESP3D so it will be forwarded to the output client
       // no need to wait to answer then

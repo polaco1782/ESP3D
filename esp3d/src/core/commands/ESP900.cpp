@@ -24,6 +24,10 @@
 #include "../esp3d_commands.h"
 #include "../esp3d_settings.h"
 
+#if defined(GCODE_HOST_FEATURE)
+#include "../../modules/gcode_host/gcode_host.h"
+#endif
+
 #define COMMAND_ID 900
 // Get state / Set Enable / Disable Serial Communication
 //[ESP900]<ENABLE/DISABLE> json=<no> [pwd=<admin password>]
@@ -48,6 +52,12 @@ void ESP3DCommands::ESP900(int cmd_params_pos, ESP3DMessage* msg) {
   }
 #endif  // AUTHENTICATION_FEATURE
   tmpstr = get_clean_param(msg, cmd_params_pos);
+#if defined(GCODE_HOST_FEATURE)
+  if (tmpstr.length() && esp3d_gcode_host.ownsPrinter()) {
+    dispatchAnswer(msg, COMMAND_ID, json, true, "Cannot change serial service during a stream");
+    return;
+  }
+#endif
   if (tmpstr.length() == 0) {
     if (esp3d_serial_service.started()) {
       ok_msg = "ENABLED";

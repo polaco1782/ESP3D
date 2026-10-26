@@ -76,13 +76,13 @@ bool Esp3D::begin() {
   BootDelay bd;
   ESP3DHal::begin();
   ESP3D_LOG_INIT_FN
+  bool res = true;
 #if defined(GCODE_HOST_FEATURE)
-  esp3d_gcode_host.begin();
+  if (!esp3d_gcode_host.begin()) res = false;
 #endif  // GCODE_HOST_FEATURE
 #if COMMUNICATION_PROTOCOL == SOCKET_SERIAL
   Serial2Socket.enable();
 #endif  // COMMUNICATION_PROTOCOL == SOCKET_SERIAL
-  bool res = true;
 #if defined(CONNECTED_DEVICES_FEATURE)
   esp3d_log("Starting Devices feature");
   if (!DevicesServices::begin()) {
@@ -219,6 +219,10 @@ bool Esp3D::started() { return _started; }
 // End ESP3D
 bool Esp3D::end() {
   _started = false;
+#if defined(GCODE_HOST_FEATURE)
+  // Stop/join the streaming task before tearing down its UART or source files.
+  esp3d_gcode_host.end();
+#endif
 #if defined(CONNECTED_DEVICES_FEATURE)
   DevicesServices::end();
 #endif  // CONNECTED_DEVICES_FEATURE
@@ -271,6 +275,9 @@ bool Esp3D::reset() {
 void Esp3D::restart_esp(bool need_restart) { restart = need_restart; }
 
 void Esp3D::restart_now() {
+#if defined(GCODE_HOST_FEATURE)
+  esp3d_gcode_host.end();
+#endif
   // patch for
   // https://github.com/espressif/arduino-esp32/issues/1912#issuecomment-426247971
 #if defined(ETH_FEATURE) && defined(ESP3D_ETH_PHY_POWER_PIN)

@@ -22,6 +22,10 @@
 #include "../esp3d_commands.h"
 #include "../esp3d_settings.h"
 
+#if defined(GCODE_HOST_FEATURE)
+#include "../../modules/gcode_host/gcode_host.h"
+#endif
+
 #define COMMAND_ID 401
 #if COMMUNICATION_PROTOCOL != SOCKET_SERIAL || defined(ESP_SERIAL_BRIDGE_OUTPUT)
 #include "../../modules/serial/serial_service.h"
@@ -82,6 +86,15 @@ void ESP3DCommands::ESP401(int cmd_params_pos, ESP3DMessage* msg) {
       hasError = true;
     }
   }
+#if defined(GCODE_HOST_FEATURE)
+  if (!hasError && esp3d_gcode_host.ownsPrinter() &&
+      (spos.toInt() == ESP_BAUD_RATE || spos.toInt() == ESP_SERIAL_BRIDGE_BAUD ||
+       spos.toInt() == ESP_SERIAL_BRIDGE_ON || spos.toInt() == ESP_OUTPUT_CLIENT ||
+       spos.toInt() == ESP_TARGET_FW)) {
+    hasError = true;
+    error_msg = "Cannot change printer transport during a stream";
+  }
+#endif
   if (!hasError) {
     switch (styp[0]) {
       case 'B':  // Byte value

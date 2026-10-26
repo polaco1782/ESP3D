@@ -23,6 +23,9 @@
 #include "../../core/esp3d_commands.h"
 #include "../../core/esp3d_settings.h"
 #include "gcode_host.h"
+#if defined(ARDUINO_ARCH_ESP32)
+#include "../serial/serial_service.h"
+#endif
 
 #if defined(FILESYSTEM_FEATURE)
 #include "../filesystem/esp_filesystem.h"
@@ -38,19 +41,39 @@ ESP_SDFile SDfileHandle;
 
 GcodeHost esp3d_gcode_host;
 
-GcodeHost::GcodeHost() { end(); }
+GcodeHost::GcodeHost() : _step(HOST_NO_STREAM), _fsType(TYPE_SCRIPT_STREAM), _needRelease(false) { end(); }
 
-GcodeHost::~GcodeHost() { end(); }
+GcodeHost::~GcodeHost() {
+  end();
+#if defined(ARDUINO_ARCH_ESP32)
+  if (_workerRx) vQueueDelete(_workerRx);
+  if (_workerUI) vQueueDelete(_workerUI);
+  if (_workerControls) vQueueDelete(_workerControls);
+  if (_workerStopped) vSemaphoreDelete(_workerStopped);
+  if (_ingressMutex) vSemaphoreDelete(_ingressMutex);
+  if (_hostMutex) vSemaphoreDelete(_hostMutex);
+#endif
+}
 
 bool GcodeHost::begin() {
   end();
+#if defined(ARDUINO_ARCH_ESP32)
+  return beginWorker();
+#else
   return true;
+#endif
 }
 
 bool GcodeHost::dispatch(ESP3DMessage* message) { 
+  Guard guard(*this);
   if (!message || _step == HOST_NO_STREAM) {
     return false;
   }
+#if defined(ARDUINO_ARCH_ESP32)
+  // UI copies (including old main-loop FIFO entries) must never ACK twice.
+  if (_background) return false;
+#endif
+  if (message->origin != (_useMarlin ? _marlinOutput : esp3d_commands.getOutputClient())) return false;
   if (message->size > 0 && message->data) {
     push(message->data, message->size);
     esp3d_message_manager.deleteMsg(message);
@@ -60,6 +83,11 @@ bool GcodeHost::dispatch(ESP3DMessage* message) {
  }
 
 void GcodeHost::end() {
+#if defined(ARDUINO_ARCH_ESP32)
+  stopWorker();
+#endif
+  Guard guard(*this);
+  if (_step != HOST_NO_STREAM) { _error = ERROR_STREAM_ABORTED; endStream(); }
   _commandNumber = 0;
   _error = ERROR_NO_ERROR;
   _step = HOST_NO_STREAM;
@@ -67,6 +95,7 @@ void GcodeHost::end() {
   _bufferSize = 0;
   _totalSize = 0;
   _processedSize = 0;
+  _needRelease = false;
 #if defined(AUTHENTICATION_FEATURE)
   _auth = ESP3DAuthenticationLevel::guest;
 #else
@@ -75,8 +104,16 @@ void GcodeHost::end() {
 }
 
 bool GcodeHost::push(const uint8_t *sbuf, size_t len) {
+  Guard guard(*this);
   if (_step == HOST_NO_STREAM) {
     return false;
+  }
+#if defined(ARDUINO_ARCH_ESP32)
+  if (_background) return false;
+#endif
+  if (_useMarlin) {
+    _marlin.receive(sbuf, len, millis());
+    return true;
   }
   esp3d_log("Push got %d bytes", len);
   for (size_t i = 0; i < len; i++) {
@@ -144,6 +181,9 @@ void GcodeHost::flush() {
 }
 
 void GcodeHost::startStream() {
+  Guard guard(*this);
+  const bool pauseOnStart = _nextStep == HOST_PAUSE_STREAM;
+  _needRelease = false;
   if (_fsType == TYPE_SCRIPT_STREAM) {
     _totalSize = _script.length();
     esp3d_log("Script line %s opened, size is %d", _script.c_str(), _totalSize);
@@ -195,9 +235,237 @@ void GcodeHost::startStream() {
   _step = HOST_READ_LINE;
   _nextStep = HOST_READ_LINE;
   _processedSize = 0;
+  if (_useMarlin) {
+    _readSize = _readPosition = _lineSize = 0;
+    _marlinPending = _marlinEOF = _lineComment = _parenComment = false;
+#if defined(ARDUINO_ARCH_ESP32)
+    if (_background) {
+      startWorker(pauseOnStart);
+      return;
+    }
+#endif
+    if (!_marlin.begin(sendMarlin, this, millis())) {
+      _error = static_cast<uint8_t>(_marlin.error());
+      _step = HOST_ERROR_STREAM;
+    } else {
+      if (pauseOnStart) _marlin.pause();
+      _step = pauseOnStart ? HOST_PAUSING_STREAM : HOST_WAIT4_ACK;
+    }
+  }
+}
+
+bool GcodeHost::ownsPrinter() const {
+  Guard guard(*this);
+  return (_useMarlin && _step != HOST_NO_STREAM) ||
+         _marlin.state() == MarlinStream::State::Fault;
+}
+
+void GcodeHost::emergencyStop() {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (_workerActive.load()) {
+    _workerEmergency.store(true);
+    notifyWorker();
+    return;
+  }
+#endif
+  Guard guard(*this);
+  // A job can own TX before its first handle() has opened the source.
+  if (_step == HOST_START_STREAM || _marlin.state() == MarlinStream::State::Fault)
+    sendMarlin(this, "\nM112\n", 6);
+  _marlin.fail(MarlinStream::Error::Printer, "emergency stop requested");
+}
+
+bool GcodeHost::queueTemperature(const char* command) {
+  Guard guard(*this);
+  if (!_useMarlin || _step == HOST_NO_STREAM || _step == HOST_START_STREAM ||
+      _step == HOST_ABORT_STREAM || !_marlin.queueTemperature(command)) return false;
+#if defined(ARDUINO_ARCH_ESP32)
+  notifyWorker();
+#endif
+  return true;
+}
+
+bool GcodeHost::sendMarlin(void* context, const char* data, size_t size) {
+  GcodeHost* host = static_cast<GcodeHost*>(context);
+#if defined(ARDUINO_ARCH_ESP32)
+  // Worker TX never enters HTTP/WebSocket routing or allocates ESP3D messages.
+  if (host->_background) {
+    ESP3DSerialService* serial = nullptr;
+#if COMMUNICATION_PROTOCOL == RAW_SERIAL
+    if (host->_marlinOutput == ESP3DClientType::serial) serial = &esp3d_serial_service;
+#endif
+#if defined(ESP_SERIAL_BRIDGE_OUTPUT)
+    if (host->_marlinOutput == ESP3DClientType::serial_bridge) serial = &serial_bridge_service;
+#endif
+    return serial && serial->writeBytes((const uint8_t*)data, size) == size;
+  }
+#endif
+  return esp3d_commands.dispatch((uint8_t*)data, size,
+      host->_marlinOutput, no_id, ESP3DMessageType::unique,
+      ESP3DClientType::stream, host->_auth);
+}
+
+// A bounded read-ahead buffer avoids one SD operation per character. Preserve
+// partial lines between scheduler calls, including arbitrarily long comments.
+int GcodeHost::readMarlinCommand() {
+  for (size_t work = 0; work < sizeof(_readBuffer); ++work) {
+    int c = -1;
+    if (_currentPosition < _totalSize) {
+      if (_fsType == TYPE_SCRIPT_STREAM) {
+        c = _script[_currentPosition];
+        if (c == ';') c = '\n';
+      } else {
+        if (_readPosition == _readSize) {
+          size_t remaining = _totalSize - _currentPosition;
+          size_t requested = remaining < sizeof(_readBuffer) ? remaining : sizeof(_readBuffer);
+          _readSize = 0;
+#if defined(FILESYSTEM_FEATURE)
+          if (_fsType == TYPE_FS_STREAM) _readSize = FSfileHandle.read(_readBuffer, requested);
+#endif
+#if defined(SD_DEVICE)
+          if (_fsType == TYPE_SD_STREAM) _readSize = SDfileHandle.read(_readBuffer, requested);
+#endif
+          _readPosition = 0;
+          if (!_readSize || _readSize > requested) {
+            _marlin.fail(MarlinStream::Error::Read, "file read failed before expected EOF");
+            return -2;
+          }
+        }
+        c = _readBuffer[_readPosition++];
+      }
+      ++_currentPosition;
+    }
+    if (c == '\n' || c == -1) {
+      if (_parenComment) {
+        _marlin.fail(MarlinStream::Error::Input, "unterminated parenthesis comment");
+        return -2;
+      }
+      _lineComment = false;
+      _line[_lineSize] = 0;
+      _currentCommand = _line;
+      _currentCommand.trim();
+      _lineSize = 0;
+      _pendingEnd = _currentPosition;
+      if (c == -1) _marlinEOF = true;
+      if (_currentCommand.length()) return 1;
+      if (c == -1) return -1;
+    } else if (!_lineComment) {
+      if (c == ';' && !_parenComment) _lineComment = true;
+      else if (c == '(' && !_parenComment) {
+        _parenComment = true;
+        // Keep adjacent tokens separated after stripping a comment.
+        if (_lineSize < MarlinStream::kLineSize) _line[_lineSize++] = ' ';
+      } else if (c == ')' && _parenComment) _parenComment = false;
+      else if (!_parenComment && c != '\r') {
+        if (_lineSize == MarlinStream::kLineSize || (c < 32 && c != '\t') || c > 126) {
+          _marlin.fail(MarlinStream::Error::Input, "invalid or overlong input line");
+          return -2;
+        }
+        _line[_lineSize++] = c == '\t' ? ' ' : c;
+      }
+    }
+  }
+  return 0;
+}
+
+String GcodeHost::diagnostics() {
+  Guard guard(*this);
+  // Hex encodes untrusted UART bytes, including control bytes and quotes.
+  const auto hex = [](const uint8_t* bytes, size_t count) {
+    static const char digits[] = "0123456789ABCDEF";
+    String result;
+    result.reserve(count * 2);
+    for (size_t i = 0; i < count; ++i) {
+      result += digits[bytes[i] >> 4];
+      result += digits[bytes[i] & 15];
+    }
+    return result;
+  };
+  String result = "{\"version\":1,\"error\":" + String((uint8_t)_marlin.error()) +
+      ",\"reason\":\"" + _marlin.reason() + "\",\"last_ack\":" + String(_marlin.lastAck()) +
+      ",\"expected_ack\":" + String(_marlin.expectedAck()) +
+      ",\"pending\":" + String(_marlin.pending()) + ",\"replies\":[";
+  for (size_t i = 0; i < _marlin.replyCount(); ++i) {
+    const auto& reply = _marlin.reply(i);
+    if (i) result += ',';
+    result += "{\"length\":" + String(reply.length) + ",\"hex\":\"" +
+              hex(reply.data, reply.size) + "\"}";
+  }
+  result += ']';
+#if defined(ARDUINO_ARCH_ESP32)
+  if (_ingressMutex && _background) {
+    uint8_t tail[sizeof(_rxTail)];
+    uint32_t errors[6], bytes, packets, overflows;
+    size_t size;
+    xSemaphoreTake(_ingressMutex, portMAX_DELAY);
+    size = _rxTailSize;
+    for (size_t i = 0; i < size; ++i)
+      tail[i] = _rxTail[(_rxTailNext + sizeof(_rxTail) - size + i) % sizeof(_rxTail)];
+    memcpy(errors, _uartErrors, sizeof(errors));
+    bytes = _rxBytes;
+    packets = _rxPackets;
+    overflows = _rxQueueOverflows;
+    xSemaphoreGive(_ingressMutex);
+    result += ",\"worker_core\":" + String(_workerCore) +
+        ",\"rx_bytes\":" + String(bytes) + ",\"rx_packets\":" + String(packets) +
+        ",\"queue_overflows\":" + String(overflows) +
+        ",\"packet_mismatches\":" + String(_packetMismatches) +
+        ",\"uart_errors_since_start\":{\"break\":" + String(errors[1]) +
+        ",\"buffer_full\":" + String(errors[2]) + ",\"fifo_overflow\":" + String(errors[3]) +
+        ",\"frame\":" + String(errors[4]) + ",\"parity\":" + String(errors[5]) +
+        "},\"rx_tail_hex\":\"" + hex(tail, size) + "\"";
+  }
+#endif
+  result += '}';
+  return result;
+}
+
+void GcodeHost::handleMarlin() {
+  // Configuration belongs to the main task; it checks changes in handle().
+#if defined(ARDUINO_ARCH_ESP32)
+  if (!_background)
+#endif
+  if (esp3d_commands.getOutputClient() != _marlinOutput)
+    _marlin.fail(MarlinStream::Error::Write, "printer output changed during stream");
+#if defined(SD_DEVICE)
+  // The SD ownership watchdog also needs service during long heating/pauses.
+  if (_fsType == TYPE_SD_STREAM && _needRelease) ESP_SD::touchWatchdog();
+#endif
+  _marlin.tick(millis());
+  for (size_t work = 0; work < MarlinStream::kSlots && _marlin.ready(); ++work) {
+    if (!_marlinPending) {
+      if (_marlinEOF) { _marlin.finish(); break; }
+      int result = readMarlinCommand();
+      if (result == 0 || result == -2) break;
+      if (result == -1) { _marlin.finish(); break; }
+      _marlinPending = true;
+    }
+    if (!_marlin.enqueue(_currentCommand.c_str(), _pendingEnd, millis())) break;
+    _marlinPending = false;
+  }
+  _processedSize = _marlin.acknowledged();
+  switch (_marlin.state()) {
+    case MarlinStream::State::Paused: _step = HOST_PAUSE_STREAM; break;
+    case MarlinStream::State::Pausing: _step = HOST_PAUSING_STREAM; break;
+    case MarlinStream::State::Cancelling: _step = HOST_ABORT_STREAM; break;
+    case MarlinStream::State::Complete:
+      _processedSize = _totalSize;
+      _step = HOST_STOP_STREAM;
+      break;
+    case MarlinStream::State::Cancelled:
+      _error = ERROR_STREAM_ABORTED;
+      _step = HOST_STOP_STREAM;
+      break;
+    case MarlinStream::State::Fault:
+      _error = static_cast<uint8_t>(_marlin.error());
+      _step = HOST_ERROR_STREAM;
+      break;
+    default: _step = HOST_WAIT4_ACK; break;
+  }
 }
 
 void GcodeHost::endStream() {
+  Guard guard(*this);
   esp3d_log("Ending Stream");
 #if defined(FILESYSTEM_FEATURE)
   if (_fsType == TYPE_FS_STREAM) {
@@ -213,10 +481,15 @@ void GcodeHost::endStream() {
     }
     if (_needRelease) {
       ESP_SD::releaseFS();
+      _needRelease = false;
     }
   }
 #endif  // SD_DEVICE
+#if defined(ARDUINO_ARCH_ESP32)
+  _workerSDLease.store(false);
+#endif
   _step = HOST_NO_STREAM;
+  if (_error != ERROR_NO_ERROR) _scriptList.clear();
   if (!_scriptList.isEmpty()){
     ScriptEntry scr = _scriptList.pop();
     processScript(scr.script.c_str(),scr.auth_type);
@@ -365,7 +638,25 @@ void GcodeHost::processCommand() {
 }
 
 void GcodeHost::handle() {
+#if defined(ARDUINO_ARCH_ESP32)
+  publishWorkerUI();  // Main task only; never hold the host mutex across network IO.
+#endif
+  Guard guard(*this);
+#if defined(ARDUINO_ARCH_ESP32)
+  if (_workerActive.load()) {
+    if (esp3d_commands.getOutputClient() != _marlinOutput) {
+      _workerEmergency.store(true);
+      notifyWorker();
+    }
+    return;
+  }
+#endif
   if (_step == HOST_NO_STREAM) {
+    return;
+  }
+  if (_useMarlin && _step != HOST_START_STREAM &&
+      _step != HOST_STOP_STREAM && _step != HOST_ERROR_STREAM) {
+    handleMarlin();
     return;
   }
   switch (_step) {
@@ -407,7 +698,9 @@ void GcodeHost::handle() {
         _error = ERROR_UNKNOW;
       }
       esp3d_log_e("Error %d", _error);
-      Error = "error: stream failed: " + String(_error) + "\n";
+      Error = "error: stream failed: " + String(_error);
+      if (_useMarlin) Error += String(" - ") + _marlin.reason();
+      Error += "\n";
       esp3d_commands.dispatch(Error.c_str(), ESP3DClientType::all_clients,
                               no_id, ESP3DMessageType::unique,
                               ESP3DClientType::system,
@@ -421,8 +714,28 @@ void GcodeHost::handle() {
 }
 
 bool GcodeHost::abort() {
+  Guard guard(*this);
   if (_step == HOST_NO_STREAM) {
     return false;
+  }
+#if defined(ARDUINO_ARCH_ESP32)
+  if (_workerActive.load()) {
+    if (_step == HOST_ABORT_STREAM) return true;
+    if (!controlWorker(Control::Cancel)) return false;
+    _step = HOST_ABORT_STREAM;
+    return true;
+  }
+#endif
+  if (_useMarlin) {
+    _scriptList.clear();
+    if (_step == HOST_START_STREAM) {
+      _error = ERROR_STREAM_ABORTED;
+      _step = HOST_NO_STREAM;
+      return true;
+    }
+    bool accepted = _marlin.cancel(millis());
+    if (accepted) _step = HOST_ABORT_STREAM;
+    return accepted;
   }
   esp3d_log("Aborting script");
   // TODO: what to do in addition ?
@@ -433,16 +746,45 @@ bool GcodeHost::abort() {
 }
 
 bool GcodeHost::pause() {
+  Guard guard(*this);
   if (_step == HOST_NO_STREAM) {
     return false;
+  }
+#if defined(ARDUINO_ARCH_ESP32)
+  if (_workerActive.load()) {
+    if (_step == HOST_PAUSE_STREAM || _step == HOST_PAUSING_STREAM ||
+        _step == HOST_ABORT_STREAM) return false;
+    if (!controlWorker(Control::Pause)) return false;
+    _step = HOST_PAUSING_STREAM;
+    return true;
+  }
+#endif
+  if (_useMarlin) {
+    if (_step == HOST_START_STREAM) { _nextStep = HOST_PAUSE_STREAM; return true; }
+    bool accepted = _marlin.pause();
+    if (accepted) _step = HOST_PAUSING_STREAM;
+    return accepted;
   }
   _nextStep = HOST_PAUSE_STREAM;
   return true;
 }
 
 bool GcodeHost::resume() {
+  Guard guard(*this);
   if (_step != HOST_PAUSE_STREAM) {
     return false;
+  }
+#if defined(ARDUINO_ARCH_ESP32)
+  if (_workerActive.load()) {
+    if (!controlWorker(Control::Resume)) return false;
+    _step = HOST_WAIT4_ACK;
+    return true;
+  }
+#endif
+  if (_useMarlin) {
+    if (!_marlin.resume()) return false;
+    _step = HOST_WAIT4_ACK;
+    return true;
   }
   _step = _nextStep;
   return true;
@@ -504,6 +846,8 @@ uint32_t GcodeHost::getCommandNumber(String &response) {
 
 bool GcodeHost::processScript(const char *line,
                               ESP3DAuthenticationLevel auth_type) {
+  Guard guard(*this);
+  if (!line || ownsPrinter()) return false;
   if (_step != HOST_NO_STREAM) {
       esp3d_log("Streaming already in progress, put to queue");
       String s = line;
@@ -519,13 +863,35 @@ bool GcodeHost::processScript(const char *line,
   }
 
   _fsType = TYPE_SCRIPT_STREAM;
+  _nextStep = HOST_READ_LINE;
   _step = HOST_START_STREAM;
-  _auth_type = auth_type;
+  _auth = _auth_type = auth_type;
+  _useMarlin = ESP3DSettings::GetFirmwareTarget() == MARLIN ||
+               ESP3DSettings::GetFirmwareTarget() == MARLIN_EMBEDDED;
+  _marlinOutput = esp3d_commands.getOutputClient();
+#if defined(ARDUINO_ARCH_ESP32)
+  _background = _useMarlin && _fsType != TYPE_FS_STREAM && (_marlinOutput == ESP3DClientType::serial ||
+                              _marlinOutput == ESP3DClientType::serial_bridge);
+  if (_background && !_workerTask) {
+    _step = HOST_NO_STREAM;
+    _error = ERROR_MEMORY_PROBLEM;
+    return false;
+  }
+#endif
+  if (_useMarlin && _marlinOutput != ESP3DClientType::serial &&
+      _marlinOutput != ESP3DClientType::serial_bridge &&
+      _marlinOutput != ESP3DClientType::usb_serial) {
+    _step = HOST_NO_STREAM;
+    _error = ERROR_CANNOT_SEND_DATA;
+    return false;
+  }
   return true;
 }
 
 bool GcodeHost::processFile(const char *filename,
                             ESP3DAuthenticationLevel auth_type) {
+  Guard guard(*this);
+  if (!filename || !filename[0] || _step != HOST_NO_STREAM || ownsPrinter()) return false;
   bool target_found = false;
   // sanity check
   _fileName = filename[0] != '/' ? "/" : "";
@@ -574,8 +940,28 @@ bool GcodeHost::processFile(const char *filename,
     esp3d_log("Processing Script file %s", _script.c_str());
     _fileName = "";
   }
+  _nextStep = HOST_READ_LINE;
   _step = HOST_START_STREAM;
-  _auth_type = auth_type;
+  _auth = _auth_type = auth_type;
+  _useMarlin = ESP3DSettings::GetFirmwareTarget() == MARLIN ||
+               ESP3DSettings::GetFirmwareTarget() == MARLIN_EMBEDDED;
+  _marlinOutput = esp3d_commands.getOutputClient();
+#if defined(ARDUINO_ARCH_ESP32)
+  _background = _useMarlin && _fsType != TYPE_FS_STREAM && (_marlinOutput == ESP3DClientType::serial ||
+                              _marlinOutput == ESP3DClientType::serial_bridge);
+  if (_background && !_workerTask) {
+    _step = HOST_NO_STREAM;
+    _error = ERROR_MEMORY_PROBLEM;
+    return false;
+  }
+#endif
+  if (_useMarlin && _marlinOutput != ESP3DClientType::serial &&
+      _marlinOutput != ESP3DClientType::serial_bridge &&
+      _marlinOutput != ESP3DClientType::usb_serial) {
+    _step = HOST_NO_STREAM;
+    _error = ERROR_CANNOT_SEND_DATA;
+    return false;
+  }
   return true;
 }
 

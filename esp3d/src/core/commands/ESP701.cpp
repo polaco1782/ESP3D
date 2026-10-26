@@ -49,6 +49,11 @@ void ESP3DCommands::ESP701(int cmd_params_pos, ESP3DMessage* msg) {
   }
 #endif  // AUTHENTICATION_FEATURE
   tmpstr = get_clean_param(msg, cmd_params_pos);
+  const bool diagnostics = tmpstr == "diag";
+  if (diagnostics) {
+    json = true;
+    tmpstr = "";
+  }
   if (tmpstr.length() == 0) {
     // give status
     switch (esp3d_gcode_host.getStatus()) {
@@ -72,12 +77,24 @@ void ESP3DCommands::ESP701(int cmd_params_pos, ESP3DMessage* msg) {
           ok_msg = "processing";
         }
         break;
+      case HOST_PAUSING_STREAM:
+        ok_msg = "pausing";
+        break;
+      case HOST_ABORT_STREAM:
+        ok_msg = "cancelling";
+        break;
       case HOST_PAUSE_STREAM:
         ok_msg = "pause";
         break;
       case HOST_NO_STREAM:
         esp3d_log("No stream %d", esp3d_gcode_host.getErrorNum());
-        if (esp3d_gcode_host.getErrorNum() != ERROR_NO_ERROR) {
+        if (esp3d_gcode_host.getErrorNum() == ERROR_STREAM_ABORTED &&
+            !esp3d_gcode_host.ownsPrinter()) {
+          // Clean cancellation releases the connection. Preserve the outcome
+          // without reporting a fault (and let the WebUI resume polling).
+          ok_msg = json ? "{\"status\":\"no stream\",\"result\":\"cancelled\"}"
+                        : "no stream (cancelled)";
+        } else if (esp3d_gcode_host.getErrorNum() != ERROR_NO_ERROR) {
           hasError = true;
           if (json) {
             error_msg = "{\"status\":\"no stream\",\"code\":\"" +
@@ -111,7 +128,7 @@ void ESP3DCommands::ESP701(int cmd_params_pos, ESP3DMessage* msg) {
       } else {
         if (tmpstr == "PAUSE") {
           if (esp3d_gcode_host.pause()) {
-            ok_msg = "Stream paused";
+            ok_msg = "Pause requested";
           } else {
             hasError = true;
             error_msg = "No stream to pause";
@@ -125,7 +142,7 @@ void ESP3DCommands::ESP701(int cmd_params_pos, ESP3DMessage* msg) {
           }
         } else if (tmpstr == "ABORT") {
           if (esp3d_gcode_host.abort()) {
-            ok_msg = "Stream aborted";
+            ok_msg = "Cancel requested";
           } else {
             error_msg = "No stream to abort";
             hasError = true;
@@ -136,6 +153,14 @@ void ESP3DCommands::ESP701(int cmd_params_pos, ESP3DMessage* msg) {
         esp3d_gcode_host.setErrorNum(ERROR_NO_ERROR);
       }
     }
+  }
+  if (diagnostics) {
+    // Existing WebUI versions parse every 701 reply as stream status. Preserve
+    // that schema and add diagnostics as a nested extension.
+    String& payload = hasError ? error_msg : ok_msg;
+    if (!payload.startsWith("{")) payload = "{\"status\":\"" + payload + "\"}";
+    payload = payload.substring(0, payload.length() - 1) +
+              ",\"diagnostics\":" + esp3d_gcode_host.diagnostics() + "}";
   }
   if (!dispatchAnswer(msg, COMMAND_ID, json, hasError,
                       hasError ? error_msg.c_str() : ok_msg.c_str())) {

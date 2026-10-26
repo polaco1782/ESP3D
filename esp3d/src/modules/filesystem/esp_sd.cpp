@@ -23,6 +23,9 @@
 #include <time.h>
 
 #include "esp_sd.h"
+#if defined(GCODE_HOST_FEATURE) && defined(ARDUINO_ARCH_ESP32)
+#include "../gcode_host/gcode_host.h"
+#endif
 
 
 #if defined(ESP3DLIB_ENV)
@@ -106,7 +109,11 @@ bool ESP_SD::disableSharedSD() {
 #endif  // SD_DEVICE_CONNECTION == ESP_SHARED_SD
 
 bool ESP_SD::_started = false;
+#if defined(ARDUINO_ARCH_ESP32)
+std::atomic<uint32_t> ESP_SD::_acquireTimestamp{0};
+#else
 uint32_t ESP_SD::_acquireTimestamp = 0;
+#endif
 uint8_t ESP_SD::_state = ESP_SDCARD_NOT_PRESENT;
 uint8_t ESP_SD::_spi_speed_divider = 1;
 bool ESP_SD::_sizechanged = true;
@@ -176,6 +183,11 @@ void ESP_SD::releaseFS(uint8_t FS) {
 }
 
 void ESP_SD::handle() {
+#if defined(GCODE_HOST_FEATURE) && defined(ARDUINO_ARCH_ESP32)
+  // The main task owns the SD lease until it closes the worker's file. Never
+  // release a live read handle because a long HTTP handler delayed main-loop IO.
+  if (esp3d_gcode_host.backgroundOwnsSD()) return;
+#endif
   if (SD_WATCHDOG_MS > 0 && _state == ESP_SDCARD_BUSY &&
       (millis() - _acquireTimestamp > SD_WATCHDOG_MS)) {
     esp3d_log_e("SD watchdog: forced release after inactivity timeout");
